@@ -1,0 +1,968 @@
+"""
+features.py
+
+Feature engineering for ML entry model on OHLCV data.
+
+Input schema (Polars DataFrame):
+    timestamp : Datetime
+    symbol    : Utf8
+    open, high, low, close, volume : Float / Int
+
+Output: same DataFrame with ~55 feature columns appended, sorted by
+        ["symbol", "timestamp"] ascending.
+
+DESIGN PRINCIPLES
+-----------------
+1. Multi-symbol safety. Every rolling/window/shift expression uses
+   `.over("symbol")` so a symbol's calculations never mix with another's.
+2. Deterministic ordering. Data is sorted by ["symbol", "timestamp"]
+   ascending once at the start; every helper assumes this and re-asserts
+   it where needed.
+3. Stateful detectors run per-symbol. Swing detection, inside-bar flags,
+   MA convergence and ATR-band consolidation are state machines ported
+   from the Pine indicator. Polars `partition_by` splits per symbol; each
+   partition is processed via numpy loops, then concatenated.
+4. Swing features come in two flavors per bar:
+     - confirmed_*  : based on swings that became confirmed at or BEFORE
+                      bar t. Leak-free.
+     - tentative_*  : the in-progress swing currently being tracked at
+                      bar t. Used by the indicator for the "SH?" / "SL?"
+                      labels.
+5. No labels are computed. Pure feature build.
+6. Higher-timeframe (weekly) features are an opt-in toggle; when enabled
+   they use the previous fully-completed week (shift-1) so they stay
+   leak-free.
+
+REQUIREMENTS
+------------
+    polars >= 0.20
+    numpy
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import polars as pl
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+# Moving averages
+EMA_FAST   = 9
+EMA_MED    = 21
+SMA_SLOW   = 50
+SMA_TREND  = 200
+
+# Volatility / range
+ATR_PERIOD     = 14
+ADR_PERIOD     = 20
+LOOKBACK_52W   = 252
+
+# Volume
+RVOL_PERIOD = 50
+
+# Swing detection (mirrors Pine indicator)
+SWING_SMOOTH   = 3
+SWING_PATIENCE = 5
+
+# Inside bar flag
+IB_PROXIMITY   = 0.003   # 0.3 %
+IB_MIN_INSIDE  = 3
+
+# MA convergence
+CONV_CUTOFF      = 0.25
+CONV_USE_CLOSE   = True
+CONV_USE_EMA9    = True
+CONV_USE_EMA21   = True
+CONV_USE_SMA50   = False
+
+# ATR band consolidation
+ATR_BAND_MA_PERIOD = 20
+ATR_BAND_MULT      = 0.5
+
+# Lookback windows for path features
+ROC_WINDOWS      = (3, 5, 10, 20, 50)
+PATH_WINDOW      = 20
+PCT_RANK_WINDOW  = 100
+EXTREMES_WINDOW  = 20
+
+# Weekly (opt-in)
+WEEKLY_MA_PERIOD     = 10   # weeks
+WEEKLY_RANGE_PERIOD  = 4    # weeks
+
+
+# ============================================================
+# ROLLING-MAP HELPERS
+# ============================================================
+# These are used with `pl.col(...).rolling_map(fn, window_size=N)` because
+# Polars has no built-in for per-window OLS or percentile rank.
+
+def _slope(s: pl.Series) -> float:
+    arr = s.to_numpy()
+    if arr.size < 2 or np.isnan(arr).any():
+        return float("nan")
+    x = np.arange(arr.size, dtype=np.float64)
+    x_mean = x.mean()
+    y_mean = arr.mean()
+    cov  = ((x - x_mean) * (arr - y_mean)).sum()
+    varx = ((x - x_mean) ** 2).sum()
+    return float(cov / varx) if varx > 0 else float("nan")
+
+
+def _r2(s: pl.Series) -> float:
+    arr = s.to_numpy()
+    if arr.size < 2 or np.isnan(arr).any():
+        return float("nan")
+    x = np.arange(arr.size, dtype=np.float64)
+    x_mean = x.mean()
+    y_mean = arr.mean()
+    cov  = ((x - x_mean) * (arr - y_mean)).sum()
+    varx = ((x - x_mean) ** 2).sum()
+    vary = ((arr - y_mean) ** 2).sum()
+    if varx <= 0 or vary <= 0:
+        return float("nan")
+    return float((cov ** 2) / (varx * vary))
+
+
+def _pct_rank(s: pl.Series) -> float:
+    """Rank of the LAST element within the window, in [0, 1]."""
+    arr = s.to_numpy()
+    if arr.size == 0 or np.isnan(arr[-1]):
+        return float("nan")
+    valid = arr[~np.isnan(arr)]
+    if valid.size == 0:
+        return float("nan")
+    return float((valid <= arr[-1]).sum() / valid.size)
+
+
+def _bars_since_max(s: pl.Series) -> float:
+    arr = s.to_numpy()
+    if arr.size == 0 or np.isnan(arr).all():
+        return float("nan")
+    arr_for_argmax = np.where(np.isnan(arr), -np.inf, arr)
+    idx = int(np.argmax(arr_for_argmax))
+    return float(arr.size - 1 - idx)
+
+
+def _bars_since_min(s: pl.Series) -> float:
+    arr = s.to_numpy()
+    if arr.size == 0 or np.isnan(arr).all():
+        return float("nan")
+    arr_for_argmin = np.where(np.isnan(arr), np.inf, arr)
+    idx = int(np.argmin(arr_for_argmin))
+    return float(arr.size - 1 - idx)
+
+
+# ============================================================
+# 1. VALIDATE & SORT
+# ============================================================
+
+REQUIRED_COLS = {"timestamp", "symbol", "open", "high", "low", "close", "volume"}
+
+
+def _validate_and_sort(df: pl.DataFrame) -> pl.DataFrame:
+    missing = REQUIRED_COLS - set(df.columns)
+    if missing:
+        raise ValueError(f"Input missing required columns: {sorted(missing)}")
+
+    # Cast OHLCV to Float64 for numeric stability
+    df = df.with_columns([
+        pl.col("open").cast(pl.Float64),
+        pl.col("high").cast(pl.Float64),
+        pl.col("low").cast(pl.Float64),
+        pl.col("close").cast(pl.Float64),
+        pl.col("volume").cast(pl.Float64),
+    ])
+
+    # Reject duplicate (symbol, timestamp) — silently breaks state machines
+    dup_count = df.group_by(["symbol", "timestamp"]).len().filter(pl.col("len") > 1).height
+    if dup_count > 0:
+        raise ValueError(
+            f"Duplicate (symbol, timestamp) rows detected ({dup_count} groups). "
+            "Deduplicate before passing to build_features()."
+        )
+
+    # Sort once. Every downstream window op assumes this ordering.
+    df = df.sort(["symbol", "timestamp"])
+
+    # Per-symbol bar index (0, 1, 2, ...). Used for swing-distance features.
+    df = df.with_columns(
+        (pl.col("close").cum_count().over("symbol") - 1)
+        .cast(pl.Int64)
+        .alias("_bar_idx")
+    )
+    return df
+
+
+# ============================================================
+# 2. BASIC INDICATORS  (MAs, ATR, smoothed series, returns)
+# ============================================================
+
+def _add_basic_indicators(df: pl.DataFrame) -> pl.DataFrame:
+    # True Range (Wilder)
+    df = df.with_columns([
+        pl.col("close").shift(1).over("symbol").alias("_prev_close"),
+    ]).with_columns([
+        pl.max_horizontal([
+            pl.col("high") - pl.col("low"),
+            (pl.col("high") - pl.col("_prev_close")).abs(),
+            (pl.col("low")  - pl.col("_prev_close")).abs(),
+        ]).alias("_tr"),
+    ]).drop("_prev_close")
+
+    # Wilder's ATR == EMA of TR with alpha = 1/period
+    df = df.with_columns([
+        pl.col("_tr").ewm_mean(alpha=1 / ATR_PERIOD, adjust=False)
+                     .over("symbol").alias("atr"),
+    ])
+
+    # Moving averages
+    df = df.with_columns([
+        pl.col("close").ewm_mean(span=EMA_FAST, adjust=False)
+                       .over("symbol").alias("ema9"),
+        pl.col("close").ewm_mean(span=EMA_MED,  adjust=False)
+                       .over("symbol").alias("ema21"),
+        pl.col("close").rolling_mean(SMA_SLOW)
+                       .over("symbol").alias("sma50"),
+        pl.col("close").rolling_mean(SMA_TREND)
+                       .over("symbol").alias("sma200"),
+    ])
+
+    # Smoothed high/low (input to swing detection state machine)
+    df = df.with_columns([
+        pl.col("high").rolling_mean(SWING_SMOOTH)
+                      .over("symbol").alias("smoothed_high"),
+        pl.col("low").rolling_mean(SWING_SMOOTH)
+                     .over("symbol").alias("smoothed_low"),
+    ])
+
+    # Simple returns (input to vol calcs and efficiency ratio)
+    df = df.with_columns([
+        (pl.col("close") / pl.col("close").shift(1).over("symbol") - 1)
+            .alias("ret_1"),
+    ])
+
+    return df
+
+
+# ============================================================
+# 3. DISPERSION  (MA convergence score) & ATR BANDS
+# ============================================================
+
+def _add_dispersion(df: pl.DataFrame) -> pl.DataFrame:
+    cols = []
+    if CONV_USE_CLOSE: cols.append("close")
+    if CONV_USE_EMA9:  cols.append("ema9")
+    if CONV_USE_EMA21: cols.append("ema21")
+    if CONV_USE_SMA50: cols.append("sma50")
+    n = len(cols)
+    if n < 2:
+        df = df.with_columns(pl.lit(None, dtype=pl.Float64).alias("dispersion"))
+        return df
+
+    df = df.with_columns(
+        pl.mean_horizontal([pl.col(c) for c in cols]).alias("_conv_mean")
+    )
+    sq = [(pl.col(c) - pl.col("_conv_mean")) ** 2 for c in cols]
+    pop_var = sum(sq) / n
+    df = df.with_columns(pop_var.sqrt().alias("_conv_std"))
+    df = df.with_columns(
+        (pl.col("_conv_std") / pl.col("atr")).alias("dispersion")
+    ).drop(["_conv_mean", "_conv_std"])
+    return df
+
+
+def _add_atr_bands(df: pl.DataFrame) -> pl.DataFrame:
+    df = df.with_columns([
+        pl.col("close").rolling_mean(ATR_BAND_MA_PERIOD)
+                       .over("symbol").alias("atr_band_ma"),
+    ])
+    df = df.with_columns([
+        (pl.col("atr_band_ma") + ATR_BAND_MULT * pl.col("atr"))
+            .alias("atr_band_upper"),
+        (pl.col("atr_band_ma") - ATR_BAND_MULT * pl.col("atr"))
+            .alias("atr_band_lower"),
+    ])
+    df = df.with_columns(
+        ((pl.col("atr_band_upper") - pl.col("atr_band_lower"))
+         / pl.col("close")).alias("atr_band_width_pct")
+    )
+    return df
+
+
+# ============================================================
+# 4. MA-RELATIVE FEATURES
+# ============================================================
+
+def _add_ma_features(df: pl.DataFrame) -> pl.DataFrame:
+    return df.with_columns([
+        ((pl.col("close") - pl.col("ema9"))   / pl.col("atr"))
+            .alias("close_to_ema9_atr"),
+        ((pl.col("close") - pl.col("ema21"))  / pl.col("atr"))
+            .alias("close_to_ema21_atr"),
+        ((pl.col("close") - pl.col("sma50"))  / pl.col("atr"))
+            .alias("close_to_sma50_atr"),
+        ((pl.col("close") - pl.col("sma200")) / pl.col("sma200"))
+            .alias("close_to_sma200_pct"),
+        ((pl.col("ema9")  - pl.col("ema21")) / pl.col("atr"))
+            .alias("ema9_to_ema21_atr"),
+        ((pl.col("ema21") - pl.col("sma50")) / pl.col("atr"))
+            .alias("ema21_to_sma50_atr"),
+        (
+            (pl.col("ema9")  > pl.col("ema21")) &
+            (pl.col("ema21") > pl.col("sma50")) &
+            (pl.col("sma50") > pl.col("sma200"))
+        ).cast(pl.Int8).alias("ma_aligned_bullish"),
+    ])
+
+
+# ============================================================
+# 5. VOLATILITY REGIME
+# ============================================================
+
+def _add_volatility_features(df: pl.DataFrame) -> pl.DataFrame:
+    df = df.with_columns([
+        pl.col("atr").rolling_mean(50).over("symbol").alias("atr_50"),
+        pl.col("ret_1").rolling_std(5).over("symbol").alias("realized_vol_5"),
+        pl.col("ret_1").rolling_std(20).over("symbol").alias("realized_vol_20"),
+    ])
+    df = df.with_columns(
+        (pl.col("atr") / pl.col("atr_50")).alias("atr_ratio_14_50")
+    )
+    return df
+
+
+# ============================================================
+# 6. VOLUME FEATURES
+# ============================================================
+
+def _add_volume_features(df: pl.DataFrame) -> pl.DataFrame:
+    df = df.with_columns([
+        pl.col("volume").rolling_mean(RVOL_PERIOD).over("symbol").alias("_vol_sma"),
+    ])
+    df = df.with_columns([
+        (pl.col("volume") / pl.col("_vol_sma")).alias("rvol"),
+    ])
+    df = df.with_columns([
+        pl.col("rvol").rolling_mean(5).over("symbol").alias("rvol_5d_avg"),
+        pl.col("rvol").rolling_mean(10).over("symbol").alias("_rvol_10d_avg"),
+    ])
+    df = df.with_columns(
+        (pl.col("rvol") - pl.col("_rvol_10d_avg")).alias("rvol_trend")
+    )
+
+    # Buying pressure: vol on green vs red bars
+    df = df.with_columns([
+        pl.when(pl.col("close") > pl.col("open"))
+          .then(pl.col("volume")).otherwise(0.0).alias("_vol_green"),
+        pl.when(pl.col("close") < pl.col("open"))
+          .then(pl.col("volume")).otherwise(0.0).alias("_vol_red"),
+    ])
+    df = df.with_columns([
+        pl.col("_vol_green").rolling_sum(10).over("symbol").alias("_vol_green_10"),
+        pl.col("_vol_red").rolling_sum(10).over("symbol").alias("_vol_red_10"),
+        pl.col("_vol_green").rolling_sum(20).over("symbol").alias("_vol_green_20"),
+        pl.col("_vol_red").rolling_sum(20).over("symbol").alias("_vol_red_20"),
+    ])
+    df = df.with_columns([
+        (pl.col("_vol_green_10") /
+         (pl.col("_vol_green_10") + pl.col("_vol_red_10") + 1e-10))
+            .alias("buying_pressure_10"),
+        (pl.col("_vol_green_20") /
+         (pl.col("_vol_green_20") + pl.col("_vol_red_20") + 1e-10))
+            .alias("buying_pressure_20"),
+    ]).drop(["_vol_green", "_vol_red", "_vol_green_10", "_vol_red_10",
+             "_vol_green_20", "_vol_red_20"])
+    return df
+
+
+# ============================================================
+# 7. PRICE-ACTION (PER BAR) FEATURES
+# ============================================================
+
+def _add_price_action_features(df: pl.DataFrame) -> pl.DataFrame:
+    rng = (pl.col("high") - pl.col("low")).clip(lower_bound=1e-10)
+    upper_body = pl.max_horizontal([pl.col("close"), pl.col("open")])
+    lower_body = pl.min_horizontal([pl.col("close"), pl.col("open")])
+    return df.with_columns([
+        ((pl.col("close") - pl.col("low")) / rng).alias("close_position_in_range"),
+        ((pl.col("close") - pl.col("open")).abs() / pl.col("atr"))
+            .alias("body_size_atr"),
+        ((pl.col("high") - upper_body) / pl.col("atr")).alias("upper_wick_atr"),
+        ((lower_body - pl.col("low")) / pl.col("atr")).alias("lower_wick_atr"),
+        (pl.col("close") > pl.col("open")).cast(pl.Int8).alias("bar_is_green"),
+    ])
+
+
+# ============================================================
+# 8. MOMENTUM (ROC) FEATURES
+# ============================================================
+
+def _add_momentum_features(df: pl.DataFrame) -> pl.DataFrame:
+    return df.with_columns([
+        (pl.col("close") / pl.col("close").shift(n).over("symbol") - 1)
+            .alias(f"roc_{n}")
+        for n in ROC_WINDOWS
+    ])
+
+
+# ============================================================
+# 9. EXTREMES & PULLBACK FEATURES
+# ============================================================
+
+def _add_extremes_features(df: pl.DataFrame) -> pl.DataFrame:
+    df = df.with_columns([
+        pl.col("high").rolling_max(EXTREMES_WINDOW).over("symbol").alias("_high_20"),
+        pl.col("low").rolling_min(EXTREMES_WINDOW).over("symbol").alias("_low_20"),
+    ])
+    df = df.with_columns([
+        ((pl.col("close") - pl.col("_high_20")) / pl.col("atr"))
+            .alias("close_to_20d_high_atr"),
+        ((pl.col("close") - pl.col("_low_20")) / pl.col("atr"))
+            .alias("close_to_20d_low_atr"),
+        ((pl.col("_high_20") - pl.col("close")) / pl.col("atr"))
+            .alias("pullback_from_20d_high_atr"),
+        # Bars-since-extremes (rolling argmax/min within last N bars)
+        pl.col("high").rolling_map(_bars_since_max, window_size=EXTREMES_WINDOW)
+                      .over("symbol").alias("bars_since_20d_high"),
+        pl.col("low").rolling_map(_bars_since_min, window_size=EXTREMES_WINDOW)
+                     .over("symbol").alias("bars_since_20d_low"),
+    ]).drop(["_high_20", "_low_20"])
+    return df
+
+
+# ============================================================
+# 10. 52-WEEK & ADR
+# ============================================================
+
+def _add_52w_and_adr(df: pl.DataFrame) -> pl.DataFrame:
+    df = df.with_columns([
+        pl.col("high").rolling_max(LOOKBACK_52W).over("symbol").alias("week_high_52"),
+        pl.col("low").rolling_min(LOOKBACK_52W).over("symbol").alias("week_low_52"),
+    ])
+    df = df.with_columns([
+        ((pl.col("close") - pl.col("week_high_52")) / pl.col("week_high_52"))
+            .alias("pct_from_52w_high"),
+        ((pl.col("close") - pl.col("week_low_52")) / pl.col("week_low_52"))
+            .alias("pct_from_52w_low"),
+        (((pl.col("high") / pl.col("low")) - 1) * 100).alias("_dr_pct"),
+    ])
+    df = df.with_columns(
+        pl.col("_dr_pct").rolling_mean(ADR_PERIOD).over("symbol").alias("adr_pct")
+    ).drop("_dr_pct")
+    return df
+
+
+# ============================================================
+# 11. PATH-QUALITY FEATURES (regression slope, R², efficiency ratio)
+# ============================================================
+
+def _add_path_quality(df: pl.DataFrame) -> pl.DataFrame:
+    # Regression slope & R² over PATH_WINDOW bars on close
+    df = df.with_columns([
+        pl.col("close").rolling_map(_slope, window_size=PATH_WINDOW)
+                       .over("symbol").alias("_slope_close_20"),
+        pl.col("close").rolling_map(_r2, window_size=PATH_WINDOW)
+                       .over("symbol").alias("regression_r2_20"),
+    ])
+    df = df.with_columns(
+        (pl.col("_slope_close_20") / pl.col("atr"))
+            .alias("regression_slope_20_atr")
+    ).drop("_slope_close_20")
+
+    # Kaufman efficiency ratio over PATH_WINDOW
+    abs_net = (pl.col("close") - pl.col("close").shift(PATH_WINDOW).over("symbol")).abs()
+    abs_steps = (pl.col("close") - pl.col("close").shift(1).over("symbol")).abs()
+    sum_abs_steps = abs_steps.rolling_sum(PATH_WINDOW).over("symbol")
+    df = df.with_columns(
+        (abs_net / (sum_abs_steps + 1e-10)).alias("efficiency_ratio_20")
+    )
+
+    # Max drawdown / max favorable excursion over PATH_WINDOW (in ATR units)
+    high_w = pl.col("close").rolling_max(PATH_WINDOW).over("symbol")
+    low_w  = pl.col("close").rolling_min(PATH_WINDOW).over("symbol")
+    df = df.with_columns([
+        ((high_w - pl.col("close")) / pl.col("atr")).alias("dd_from_20d_high_atr"),
+        ((pl.col("close") - low_w)  / pl.col("atr")).alias("rise_from_20d_low_atr"),
+    ])
+    return df
+
+
+# ============================================================
+# 12. PERCENTILE-RANK FEATURES
+# ============================================================
+
+def _add_percentile_ranks(df: pl.DataFrame) -> pl.DataFrame:
+    return df.with_columns([
+        pl.col("atr").rolling_map(
+            _pct_rank, window_size=PCT_RANK_WINDOW, min_periods=20
+        ).over("symbol").alias("atr_pct_rank_100"),
+        pl.col("dispersion").rolling_map(
+            _pct_rank, window_size=PCT_RANK_WINDOW, min_periods=20
+        ).over("symbol").alias("dispersion_pct_rank_100"),
+    ])
+
+
+# ============================================================
+# 13. STATEFUL DETECTORS  (per-symbol numpy loops)
+# ============================================================
+# Ports the four state machines from the Pine indicator:
+#   - Swing detection (smoothed-extreme + patience)
+#   - Inside-bar flag tracker
+#   - MA convergence (per-bar threshold on dispersion)
+#   - ATR-band consolidation tracker
+
+def _stateful_per_symbol(df: pl.DataFrame) -> pl.DataFrame:
+    """Run all four state machines for ONE symbol's already-sorted data."""
+    # Pull the inputs as numpy arrays — fast loop-friendly access
+    high_arr = df["high"].to_numpy()
+    low_arr  = df["low"].to_numpy()
+    close_arr= df["close"].to_numpy()
+    smH      = df["smoothed_high"].to_numpy()
+    smL      = df["smoothed_low"].to_numpy()
+    atr      = df["atr"].to_numpy()
+    disp     = df["dispersion"].to_numpy()
+    a_up     = df["atr_band_upper"].to_numpy()
+    a_lo     = df["atr_band_lower"].to_numpy()
+    n = df.height
+
+    # ---- output arrays ----
+    ib_count_o   = np.zeros(n, dtype=np.int32)
+    bars_since_flag_o   = np.full(n, np.nan)
+    last_pole_w_atr_o   = np.full(n, np.nan)
+
+    in_conv_o    = np.zeros(n, dtype=np.int8)
+    bars_in_conv_o      = np.zeros(n, dtype=np.int32)
+    bars_since_conv_o   = np.full(n, np.nan)
+
+    in_band_o    = np.zeros(n, dtype=np.int8)
+    bars_in_band_o      = np.zeros(n, dtype=np.int32)
+    bars_since_band_o   = np.full(n, np.nan)
+    last_band_w_atr_o   = np.full(n, np.nan)
+
+    last_sh_bar_o   = np.full(n, np.nan)
+    last_sh_price_o = np.full(n, np.nan)
+    last_sl_bar_o   = np.full(n, np.nan)
+    last_sl_price_o = np.full(n, np.nan)
+    hh_o = np.zeros(n, dtype=np.int8)
+    ll_o = np.zeros(n, dtype=np.int8)
+    lh_o = np.zeros(n, dtype=np.int8)
+    hl_o = np.zeros(n, dtype=np.int8)
+    tent_type_o   = np.zeros(n, dtype=np.int8)   # +1 = looking-for-high, -1 = looking-for-low
+    tent_bar_o    = np.full(n, np.nan)
+    tent_price_o  = np.full(n, np.nan)
+
+    # ---- state vars ----
+    # IB flag
+    pole_bar = -1
+    pole_hi = np.nan
+    pole_lo = np.nan
+    ib_count = 0
+    last_flag_end = -1
+    last_flag_pole_w = np.nan
+
+    # Swings
+    sw_state = 1            # +1 = looking for high, -1 = looking for low
+    sm_extreme = np.nan
+    actual_bar = -1
+    actual_price = np.nan
+    stale = 0
+    confirmed_h: list[tuple[int, float]] = []   # (bar_idx, price)
+    confirmed_l: list[tuple[int, float]] = []
+
+    # MA convergence
+    in_conv = False
+    conv_streak = 0
+    last_conv_exit = -1
+
+    # ATR band
+    in_band = False
+    band_streak = 0
+    last_band_exit = -1
+    band_max_hi = np.nan
+    band_min_lo = np.nan
+    last_band_w = np.nan
+
+    for i in range(n):
+        # ============================================
+        # Inside Bar Flag tracker
+        # ============================================
+        if pole_bar < 0 or np.isnan(pole_hi):
+            pole_bar = i
+            pole_hi  = high_arr[i]
+            pole_lo  = low_arr[i]
+            ib_count = 0
+        else:
+            hi_ok = high_arr[i] <= pole_hi * (1.0 + IB_PROXIMITY)
+            lo_ok = low_arr[i]  >= pole_lo * (1.0 - IB_PROXIMITY)
+            if hi_ok and lo_ok:
+                ib_count += 1
+            else:
+                if ib_count >= IB_MIN_INSIDE:
+                    last_flag_end    = i - 1
+                    last_flag_pole_w = pole_hi - pole_lo
+                pole_bar = i
+                pole_hi  = high_arr[i]
+                pole_lo  = low_arr[i]
+                ib_count = 0
+        ib_count_o[i] = ib_count
+        if last_flag_end >= 0:
+            bars_since_flag_o[i] = i - last_flag_end
+            if not np.isnan(atr[i]) and atr[i] > 0:
+                last_pole_w_atr_o[i] = last_flag_pole_w / atr[i]
+
+        # ============================================
+        # Swing detection state machine
+        # ============================================
+        sm_curr     = smH[i] if sw_state == 1 else smL[i]
+        actual_curr = high_arr[i] if sw_state == 1 else low_arr[i]
+        if not np.isnan(sm_curr):
+            improved = (np.isnan(sm_extreme) or
+                        (sm_curr > sm_extreme if sw_state == 1
+                         else sm_curr < sm_extreme))
+            if improved:
+                sm_extreme   = sm_curr
+                actual_bar   = i
+                actual_price = actual_curr
+                stale = 0
+            else:
+                stale += 1
+                if not np.isnan(actual_price):
+                    further = (actual_curr > actual_price if sw_state == 1
+                               else actual_curr < actual_price)
+                    if further:
+                        actual_bar   = i
+                        actual_price = actual_curr
+            if stale >= SWING_PATIENCE and actual_bar >= 0:
+                # CONFIRM the swing
+                if sw_state == 1:
+                    confirmed_h.append((actual_bar, actual_price))
+                else:
+                    confirmed_l.append((actual_bar, actual_price))
+                # flip and reset
+                sw_state = -sw_state
+                sm_extreme   = smH[i] if sw_state == 1 else smL[i]
+                actual_bar   = i
+                actual_price = high_arr[i] if sw_state == 1 else low_arr[i]
+                stale = 0
+
+        # Confirmed-swing snapshots at bar i
+        if confirmed_h:
+            last_sh_bar_o[i]   = confirmed_h[-1][0]
+            last_sh_price_o[i] = confirmed_h[-1][1]
+        if confirmed_l:
+            last_sl_bar_o[i]   = confirmed_l[-1][0]
+            last_sl_price_o[i] = confirmed_l[-1][1]
+
+        # Patterns over LAST 3 confirmed swings of each type
+        if len(confirmed_h) >= 3:
+            p1, p2, p3 = confirmed_h[-3][1], confirmed_h[-2][1], confirmed_h[-1][1]
+            hh_o[i] = 1 if p1 < p2 < p3 else 0
+            lh_o[i] = 1 if p1 > p2 > p3 else 0
+        if len(confirmed_l) >= 3:
+            p1, p2, p3 = confirmed_l[-3][1], confirmed_l[-2][1], confirmed_l[-1][1]
+            hl_o[i] = 1 if p1 < p2 < p3 else 0
+            ll_o[i] = 1 if p1 > p2 > p3 else 0
+
+        # Tentative swing snapshot (in-progress)
+        tent_type_o[i] = sw_state
+        if actual_bar >= 0:
+            tent_bar_o[i]   = actual_bar
+            tent_price_o[i] = actual_price
+
+        # ============================================
+        # MA Convergence (per-bar threshold)
+        # ============================================
+        is_conv_now = (not np.isnan(disp[i])) and (disp[i] < CONV_CUTOFF)
+        if is_conv_now:
+            if not in_conv:
+                in_conv = True
+                conv_streak = 1
+            else:
+                conv_streak += 1
+        else:
+            if in_conv:
+                last_conv_exit = i - 1
+            in_conv = False
+            conv_streak = 0
+        in_conv_o[i] = 1 if in_conv else 0
+        bars_in_conv_o[i] = conv_streak
+        if last_conv_exit >= 0:
+            bars_since_conv_o[i] = i - last_conv_exit
+
+        # ============================================
+        # ATR-band consolidation tracker
+        # ============================================
+        in_band_now = ((not np.isnan(a_up[i])) and (not np.isnan(a_lo[i])) and
+                       (close_arr[i] <= a_up[i]) and (close_arr[i] >= a_lo[i]))
+        if in_band_now:
+            if not in_band:
+                in_band = True
+                band_streak = 1
+                band_max_hi = a_up[i]
+                band_min_lo = a_lo[i]
+            else:
+                band_streak += 1
+                band_max_hi = max(band_max_hi, a_up[i])
+                band_min_lo = min(band_min_lo, a_lo[i])
+        else:
+            if in_band:
+                last_band_exit = i - 1
+                last_band_w = band_max_hi - band_min_lo
+            in_band = False
+            band_streak = 0
+        in_band_o[i] = 1 if in_band else 0
+        bars_in_band_o[i] = band_streak
+        if last_band_exit >= 0:
+            bars_since_band_o[i] = i - last_band_exit
+            if (not np.isnan(atr[i])) and atr[i] > 0 and (not np.isnan(last_band_w)):
+                last_band_w_atr_o[i] = last_band_w / atr[i]
+
+    return df.with_columns([
+        pl.Series("ib_count",                    ib_count_o),
+        pl.Series("bars_since_last_flag",        bars_since_flag_o),
+        pl.Series("last_pole_width_atr",         last_pole_w_atr_o),
+
+        pl.Series("is_in_convergence",           in_conv_o),
+        pl.Series("bars_in_convergence_streak",  bars_in_conv_o),
+        pl.Series("bars_since_convergence_exit", bars_since_conv_o),
+
+        pl.Series("is_in_atr_band",              in_band_o),
+        pl.Series("bars_in_atr_band_streak",     bars_in_band_o),
+        pl.Series("bars_since_atr_band_exit",    bars_since_band_o),
+        pl.Series("last_atr_box_width_atr",      last_band_w_atr_o),
+
+        pl.Series("confirmed_sh_bar_idx",        last_sh_bar_o),
+        pl.Series("confirmed_sh_price",          last_sh_price_o),
+        pl.Series("confirmed_sl_bar_idx",        last_sl_bar_o),
+        pl.Series("confirmed_sl_price",          last_sl_price_o),
+        pl.Series("hh_pattern",                  hh_o),
+        pl.Series("ll_pattern",                  ll_o),
+        pl.Series("lh_pattern",                  lh_o),
+        pl.Series("hl_pattern",                  hl_o),
+
+        pl.Series("tentative_swing_type",        tent_type_o),
+        pl.Series("tentative_swing_bar_idx",     tent_bar_o),
+        pl.Series("tentative_swing_price",       tent_price_o),
+    ])
+
+
+def _add_stateful_features(df: pl.DataFrame) -> pl.DataFrame:
+    parts = [
+        _stateful_per_symbol(g.sort("timestamp"))
+        for g in df.partition_by("symbol", maintain_order=True)
+    ]
+    return pl.concat(parts).sort(["symbol", "timestamp"])
+
+
+# ============================================================
+# 14. DERIVED SWING / DIST FEATURES  (use stateful outputs)
+# ============================================================
+
+def _add_derived_swing_features(df: pl.DataFrame) -> pl.DataFrame:
+    return df.with_columns([
+        # Bars since last confirmed swing of each type
+        (pl.col("_bar_idx") - pl.col("confirmed_sh_bar_idx"))
+            .alias("bars_since_confirmed_sh"),
+        (pl.col("_bar_idx") - pl.col("confirmed_sl_bar_idx"))
+            .alias("bars_since_confirmed_sl"),
+
+        # Distance to last confirmed swings (in ATR units; sign indicates side)
+        ((pl.col("close") - pl.col("confirmed_sh_price")) / pl.col("atr"))
+            .alias("dist_to_confirmed_sh_atr"),
+        ((pl.col("close") - pl.col("confirmed_sl_price")) / pl.col("atr"))
+            .alias("dist_to_confirmed_sl_atr"),
+
+        # Tentative-swing derived
+        (pl.col("_bar_idx") - pl.col("tentative_swing_bar_idx"))
+            .alias("bars_in_tentative_swing"),
+        ((pl.col("close") - pl.col("tentative_swing_price")) / pl.col("atr"))
+            .alias("dist_to_tentative_atr"),
+    ])
+
+
+# ============================================================
+# 15. WEEKLY (OPT-IN) FEATURES
+# ============================================================
+# Built from calendar weeks (truncated to Monday). Daily bars in week W
+# are joined to weekly stats computed at the END of week W-1, so the
+# higher-timeframe context is leak-free.
+
+def _add_weekly_features(df: pl.DataFrame) -> pl.DataFrame:
+    df_wk = df.with_columns(
+        pl.col("timestamp").dt.truncate("1w").alias("_week_start")
+    )
+
+    weekly = (df_wk
+        .group_by(["symbol", "_week_start"])
+        .agg([
+            pl.col("close").last().alias("_w_close"),
+            pl.col("close").first().alias("_w_open"),
+            pl.col("high").max().alias("_w_high"),
+            pl.col("low").min().alias("_w_low"),
+        ])
+        .sort(["symbol", "_week_start"])
+    )
+
+    weekly = weekly.with_columns([
+        pl.col("_w_close").rolling_mean(WEEKLY_MA_PERIOD)
+                          .over("symbol").alias("_w_ma_10"),
+        pl.col("_w_high").rolling_max(WEEKLY_RANGE_PERIOD)
+                         .over("symbol").alias("_w_4w_high"),
+        pl.col("_w_low").rolling_min(WEEKLY_RANGE_PERIOD)
+                        .over("symbol").alias("_w_4w_low"),
+        (pl.col("_w_close") /
+         pl.col("_w_close").shift(WEEKLY_RANGE_PERIOD).over("symbol") - 1)
+            .alias("_w_roc_4_raw"),
+        (pl.col("_w_close") > pl.col("_w_open")).cast(pl.Int8)
+            .alias("_w_green_raw"),
+    ])
+    weekly = weekly.with_columns([
+        (pl.col("_w_close") > pl.col("_w_ma_10")).cast(pl.Int8)
+            .alias("_w_above_ma_raw"),
+        ((pl.col("_w_close") - pl.col("_w_4w_low")) /
+         (pl.col("_w_4w_high") - pl.col("_w_4w_low") + 1e-10))
+            .alias("_w_pos_4w_raw"),
+    ])
+
+    # SHIFT 1 week so daily bars in week W see week W-1's stats only
+    weekly_shifted = weekly.with_columns([
+        pl.col("_w_above_ma_raw").shift(1).over("symbol")
+            .alias("weekly_close_above_10w_ma"),
+        pl.col("_w_pos_4w_raw").shift(1).over("symbol")
+            .alias("weekly_position_in_4w_range"),
+        pl.col("_w_roc_4_raw").shift(1).over("symbol")
+            .alias("weekly_roc_4"),
+        pl.col("_w_green_raw").shift(1).over("symbol")
+            .alias("prev_weekly_bar_green"),
+    ]).select([
+        "symbol", "_week_start",
+        "weekly_close_above_10w_ma",
+        "weekly_position_in_4w_range",
+        "weekly_roc_4",
+        "prev_weekly_bar_green",
+    ])
+
+    return df_wk.join(
+        weekly_shifted, on=["symbol", "_week_start"], how="left"
+    ).drop("_week_start")
+
+
+# ============================================================
+# 16. MIN-HISTORY FLAG & CLEANUP
+# ============================================================
+
+def _add_min_history_flag(df: pl.DataFrame) -> pl.DataFrame:
+    """Mark rows that have enough history for ALL features to be valid.
+    SMA200 is the longest deterministic-warmup feature; 252-bar 52w needs
+    even more. Use 252 as the safe floor."""
+    return df.with_columns(
+        (pl.col("_bar_idx") >= LOOKBACK_52W).cast(pl.Int8)
+            .alias("min_history_met")
+    )
+
+
+def _drop_intermediates(df: pl.DataFrame) -> pl.DataFrame:
+    drop = [c for c in df.columns if c.startswith("_")]
+    drop += ["_tr"] if "_tr" in df.columns else []
+    drop += ["smoothed_high", "smoothed_low"]   # raw inputs to swing detector
+    return df.drop([c for c in drop if c in df.columns])
+
+
+# ============================================================
+# MAIN ENTRY POINT
+# ============================================================
+
+def build_features(
+    df: pl.DataFrame,
+    *,
+    add_weekly: bool = False,
+    drop_intermediate_cols: bool = True,
+) -> pl.DataFrame:
+    """Build the full feature set for an OHLCV multi-symbol DataFrame.
+
+    Parameters
+    ----------
+    df : pl.DataFrame
+        Required columns: timestamp, symbol, open, high, low, close, volume.
+    add_weekly : bool
+        If True, append weekly higher-timeframe context features
+        (computed from the most recent FULLY COMPLETED week — leak-free).
+    drop_intermediate_cols : bool
+        If True (default), drop scratch columns prefixed with "_" and
+        smoothed_high/smoothed_low. Set False to inspect intermediates.
+
+    Returns
+    -------
+    pl.DataFrame sorted by ["symbol", "timestamp"] ascending, with all
+    feature columns appended.
+    """
+    df = _validate_and_sort(df)
+    df = _add_basic_indicators(df)
+    df = _add_dispersion(df)
+    df = _add_atr_bands(df)
+    df = _add_ma_features(df)
+    df = _add_volatility_features(df)
+    df = _add_volume_features(df)
+    df = _add_price_action_features(df)
+    df = _add_momentum_features(df)
+    df = _add_extremes_features(df)
+    df = _add_52w_and_adr(df)
+    df = _add_path_quality(df)
+    df = _add_percentile_ranks(df)
+    df = _add_stateful_features(df)        # per-symbol numpy loops
+    df = _add_derived_swing_features(df)   # uses stateful outputs
+    if add_weekly:
+        df = _add_weekly_features(df)
+    df = _add_min_history_flag(df)
+    if drop_intermediate_cols:
+        df = _drop_intermediates(df)
+    return df.sort(["symbol", "timestamp"])
+
+
+# ============================================================
+# EXAMPLE USAGE
+# ============================================================
+
+if __name__ == "__main__":
+    # Synthetic demo: 3 symbols, 800 daily bars each, GBM-ish prices
+    rng = np.random.default_rng(42)
+    rows = []
+    for sym in ["AAA", "BBB", "CCC"]:
+        price = 100.0
+        for i in range(800):
+            ts = np.datetime64("2020-01-01") + np.timedelta64(i, "D")
+            ret = rng.normal(0.0005, 0.015)
+            price = max(0.01, price * (1 + ret))
+            o = price * (1 + rng.normal(0, 0.003))
+            h = max(o, price) * (1 + abs(rng.normal(0, 0.005)))
+            l = min(o, price) * (1 - abs(rng.normal(0, 0.005)))
+            c = price
+            v = float(rng.integers(500_000, 5_000_000))
+            rows.append((ts, sym, o, h, l, c, v))
+
+    df = pl.DataFrame(
+        rows,
+        schema=["timestamp", "symbol", "open", "high", "low", "close", "volume"],
+        orient="row",
+    ).with_columns(pl.col("timestamp").cast(pl.Datetime))
+
+    feats = build_features(df, add_weekly=True)
+    print(f"Input  : {df.shape}")
+    print(f"Output : {feats.shape}")
+    print(f"\nColumns ({len(feats.columns)}):")
+    for c in feats.columns:
+        print(f"  {c}")
+    print("\nLast 3 rows of AAA (selected cols):")
+    print(
+        feats.filter(pl.col("symbol") == "AAA")
+             .tail(3)
+             .select([
+                 "timestamp", "close", "atr", "rvol", "adr_pct",
+                 "dispersion", "is_in_convergence",
+                 "bars_since_confirmed_sh", "dist_to_confirmed_sh_atr",
+                 "regression_slope_20_atr", "efficiency_ratio_20",
+                 "min_history_met",
+             ])
+    )

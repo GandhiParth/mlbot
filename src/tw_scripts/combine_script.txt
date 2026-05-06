@@ -1,0 +1,690 @@
+//@version=6
+indicator("Combined Suite: MAs + Structure + Consolidation",
+     overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=500, max_bars_back=5000)
+
+// ============================================================
+// INPUTS
+// ============================================================
+
+// --- Stats ---
+g_stats = "① Stats (RVOL / ADR / 52W)"
+hl_length    = input.int(252, "52W Lookback (bars)", minval=1, group=g_stats)
+adr_period   = input.int(20,  "ADR Period (bars)",  minval=1, group=g_stats)
+rvol_period  = input.int(50,  "RVOL SMA Period",    minval=1, group=g_stats)
+
+// --- Swing Point Detection ---
+g_swing = "② Swing Point Detection"
+swing_smooth   = input.int(3,  "Smoothing Period",       minval=2, maxval=10, group=g_swing)
+patience       = input.int(5,  "Patience (bars)",        minval=2, maxval=20, group=g_swing)
+show_swings    = input.bool(true, "Show Swing Points",                       group=g_swing)
+show_tentative = input.bool(true, "Show Tentative Marker",                   group=g_swing)
+swing_max_show = input.int(10, "Max Swings to Show",     minval=2, maxval=50, group=g_swing)
+swing_sh_color = input.color(color.new(#ef5350, 0),  "Swing High Color",     group=g_swing)
+swing_sl_color = input.color(color.new(#26a69a, 0),  "Swing Low Color",      group=g_swing)
+tent_sh_color  = input.color(color.new(#ef5350, 50), "Tentative SH Color",   group=g_swing)
+tent_sl_color  = input.color(color.new(#26a69a, 50), "Tentative SL Color",   group=g_swing)
+
+// --- Macro Trendlines (single current pair) ---
+g_tl = "③ Macro Trendlines (single pair)"
+show_res_tl    = input.bool(true, "Show Resistance Trendline", group=g_tl)
+show_sup_tl    = input.bool(true, "Show Support Trendline",    group=g_tl)
+tl_n_points    = input.int(3,  "Points to Fit Line", minval=2, maxval=6,  group=g_tl)
+tl_extend_bars = input.int(10, "Extend Line (bars)", minval=0, maxval=30, group=g_tl)
+tl_res_color   = input.color(color.new(#ef5350, 30), "Resistance Color", group=g_tl)
+tl_sup_color   = input.color(color.new(#26a69a, 30), "Support Color",    group=g_tl)
+
+// --- Inside Bar Flags ( BLUE ) ---
+g_flag = "④ Inside Bar Flags  >  BLUE"
+show_flags      = input.bool(true, "Show Completed Flags",  group=g_flag)
+show_flags_live = input.bool(true, "Show In-Progress Flag", group=g_flag)
+flag_min_inside = input.int(3,   "Min Inside Bars",   minval=1, maxval=15, group=g_flag)
+flag_proximity  = input.float(0.3, "Proximity %",     minval=0.0, maxval=2.0, step=0.1, group=g_flag)
+flag_max_show   = input.int(3,   "Max Historical Flags (last N)", minval=1, maxval=20, group=g_flag)
+flag_box_color  = input.color(color.new(#1e88e5, 88), "Box Fill",     group=g_flag)
+flag_border_col = input.color(color.new(#1e88e5, 0),  "Box Border",   group=g_flag)
+flag_lbl_color  = input.color(color.new(#1e88e5, 20), "Label Color",  group=g_flag)
+
+// --- MA Convergence Zones ( PURPLE ) ---
+g_conv = "⑤ MA Convergence Zones  >  PURPLE"
+show_conv       = input.bool(true, "Show Completed Convergence Zones", group=g_conv)
+show_conv_live  = input.bool(true, "Show In-Progress Convergence",     group=g_conv)
+conv_use_close  = input.bool(true,  "Use Close",  group=g_conv)
+conv_use_ema9   = input.bool(true,  "Use EMA 9",  group=g_conv)
+conv_use_ema21  = input.bool(true,  "Use EMA 21", group=g_conv)
+conv_use_sma50  = input.bool(false, "Use SMA 50", group=g_conv)
+conv_atr_period = input.int(14,   "ATR Period",          minval=5, maxval=50, group=g_conv)
+conv_cutoff     = input.float(0.25, "Dispersion Cutoff", minval=0.05, maxval=1.0, step=0.05, group=g_conv)
+conv_min_bars   = input.int(7,    "Min Bars (window scan start)", minval=3, maxval=20, group=g_conv)
+conv_max_bars   = input.int(20,   "Max Bars (window scan end)",   minval=10, maxval=50, group=g_conv)
+conv_max_show   = input.int(3,    "Max Historical Zones (last N)", minval=1, maxval=20, group=g_conv)
+conv_box_color  = input.color(color.new(#8e24aa, 88), "Box Fill",    group=g_conv)
+conv_border_col = input.color(color.new(#8e24aa, 0),  "Box Border",  group=g_conv)
+conv_lbl_color  = input.color(color.new(#8e24aa, 20), "Label Color", group=g_conv)
+
+// --- ATR Band Consolidation ( AMBER ) ---
+g_atr = "⑥ ATR Band Consolidation  >  AMBER"
+show_atr_bands  = input.bool(true, "Show ATR Bands",        group=g_atr)
+show_atr_boxes  = input.bool(true, "Show Completed Boxes",  group=g_atr)
+show_atr_live   = input.bool(true, "Show In-Progress Box",  group=g_atr)
+atr_ma_length   = input.int(20, "Band MA Length", minval=1, group=g_atr)
+atr_ma_type     = input.string("SMA", "Band MA Type", options=["SMA","EMA"], group=g_atr)
+atr_length      = input.int(14, "ATR Length",   minval=1, group=g_atr)
+atr_mult        = input.float(0.5, "ATR Multiplier", minval=0.0, step=0.1, group=g_atr)
+atr_min_bars    = input.int(3, "Min Bars Inside Band",       minval=1, group=g_atr)
+atr_max_show    = input.int(5, "Max Historical Boxes (last N)", minval=1, maxval=30, group=g_atr)
+atr_ma_color    = input.color(color.new(#ff8f00, 0),  "Band MA Color",     group=g_atr)
+atr_band_color  = input.color(color.new(#ff8f00, 30), "Band Line Color",   group=g_atr)
+atr_fill_color  = input.color(color.new(#ff8f00, 92), "Band Fill Color",   group=g_atr)
+atr_box_color   = input.color(color.new(#ff8f00, 88), "Box Fill",          group=g_atr)
+atr_border_col  = input.color(color.new(#ff8f00, 0),  "Box Border",        group=g_atr)
+atr_lbl_color   = input.color(color.new(#ff8f00, 20), "Label Color",       group=g_atr)
+
+
+// ============================================================
+// CORE CALCULATIONS
+// ============================================================
+
+// Moving Averages
+ema9   = ta.ema(close, 9)
+ema21  = ta.ema(close, 21)
+sma50  = ta.sma(close, 50)
+sma200 = ta.sma(close, 200)
+
+plot(ema9,   color=#FFD700, linewidth=2, title="EMA 9")
+plot(ema21,  color=#FF00FF, linewidth=2, title="EMA 21")
+plot(sma50,  color=#FFFFFF, linewidth=2, title="SMA 50")
+plot(sma200, color=#b2beb5, linewidth=1, title="SMA 200")
+
+// 52-Week H/L (kept for data window / future use)
+weekHigh = ta.highest(high, hl_length)
+weekLow  = ta.lowest(low,  hl_length)
+
+// ADR % (average daily range as percentage)
+adr_pct  = ta.sma((high / low - 1) * 100, adr_period)
+adr_text = na(adr_pct) ? "NA" : str.tostring(math.round(adr_pct, 2)) + "%"
+
+// RVOL
+vol_sma      = ta.sma(volume, rvol_period)
+rvol         = vol_sma == 0 ? na : (volume / vol_sma) * 100
+rvol_rounded = na(rvol) ? na : math.round(rvol)
+rvol_text    = na(rvol_rounded) ? "NA" : str.tostring(rvol_rounded) + "%"
+
+// Smoothed series for swing detection
+smoothed_high = ta.sma(high, swing_smooth)
+smoothed_low  = ta.sma(low,  swing_smooth)
+
+// ATR Bands
+atr_ma_val = atr_ma_type == "SMA" ? ta.sma(close, atr_ma_length) : ta.ema(close, atr_ma_length)
+atr_val    = ta.atr(atr_length)
+atr_upper  = atr_ma_val + atr_mult * atr_val
+atr_lower  = atr_ma_val - atr_mult * atr_val
+
+plot(show_atr_bands ? atr_ma_val : na, "Band MA",     color=atr_ma_color,   linewidth=2)
+uPlot = plot(show_atr_bands ? atr_upper : na, "Upper Band", color=atr_band_color)
+lPlot = plot(show_atr_bands ? atr_lower : na, "Lower Band", color=atr_band_color)
+fill(uPlot, lPlot, color=atr_fill_color, title="Band Fill")
+
+
+// ============================================================
+// MA CONVERGENCE: dispersion + rolling buffer
+// ============================================================
+
+conv_atr = ta.atr(conv_atr_period)
+
+conv_n   = 0.0
+conv_sum = 0.0
+if conv_use_close
+    conv_n   += 1
+    conv_sum += close
+if conv_use_ema9
+    conv_n   += 1
+    conv_sum += ema9
+if conv_use_ema21
+    conv_n   += 1
+    conv_sum += ema21
+if conv_use_sma50
+    conv_n   += 1
+    conv_sum += sma50
+conv_mean = conv_n > 0 ? conv_sum / conv_n : 0.0
+
+conv_var = 0.0
+if conv_use_close
+    conv_var += (close - conv_mean) * (close - conv_mean)
+if conv_use_ema9
+    conv_var += (ema9 - conv_mean)  * (ema9 - conv_mean)
+if conv_use_ema21
+    conv_var += (ema21 - conv_mean) * (ema21 - conv_mean)
+if conv_use_sma50
+    conv_var += (sma50 - conv_mean) * (sma50 - conv_mean)
+
+conv_pop_std = conv_n >= 2 ? math.sqrt(conv_var / conv_n) : 0.0
+dispersion   = not na(conv_atr) and conv_atr > 0 and conv_n >= 2 ? conv_pop_std / conv_atr : na
+disp_text    = not na(dispersion) ? str.tostring(math.round(dispersion, 3)) : "N/A"
+
+// Rolling dispersion array (used by backward-scan)
+var disp_arr = array.new_float(0)
+array.push(disp_arr, dispersion)
+if array.size(disp_arr) > conv_max_bars + 5
+    array.shift(disp_arr)
+
+
+// ============================================================
+// MA CONVERGENCE: backward window scan
+// ============================================================
+// Original-style scan: for each window size w from conv_min_bars to conv_max_bars,
+// average dispersion over the most recent w bars. Increase w as long as avg < cutoff.
+// Stop at the first w where avg >= cutoff (or invalid). best_window = largest valid w.
+
+calc_best_window() =>
+    d_size = array.size(disp_arr)
+    bw = 0
+    if d_size >= conv_min_bars
+        for w = conv_min_bars to math.min(conv_max_bars, d_size)
+            d_sum = 0.0
+            valid = true
+            for j = 0 to w - 1
+                idx = d_size - 1 - j
+                if idx < 0
+                    valid := false
+                    break
+                d_val = array.get(disp_arr, idx)
+                if na(d_val)
+                    valid := false
+                    break
+                d_sum += d_val
+            if valid
+                d_avg = d_sum / w
+                if d_avg < conv_cutoff
+                    bw := w
+                else
+                    break
+            else
+                break
+    bw
+
+best_window = calc_best_window()
+is_in_conv  = best_window >= conv_min_bars
+
+
+// ============================================================
+// MA CONVERGENCE: state machine (single box per period)
+// ============================================================
+
+var bool  prev_in_conv  = false
+var int   conv_start    = na
+var float conv_zone_hi  = na
+var float conv_zone_lo  = na
+var float conv_disp_sum = 0.0
+var int   conv_disp_cnt = 0
+
+var c_start = array.new_int(0)
+var c_end   = array.new_int(0)
+var c_hi    = array.new_float(0)
+var c_lo    = array.new_float(0)
+var c_avg   = array.new_float(0)
+
+// Entering convergence: lock start, scan back over best_window bars to set bounds
+if is_in_conv and not prev_in_conv
+    conv_start    := bar_index - best_window + 1
+    conv_zone_hi  := high
+    conv_zone_lo  := low
+    conv_disp_sum := 0.0
+    conv_disp_cnt := 0
+    d_size_e = array.size(disp_arr)
+    for j = 0 to best_window - 1
+        // Bounds from price series
+        if not na(high[j]) and high[j] > conv_zone_hi
+            conv_zone_hi := high[j]
+        if not na(low[j]) and low[j] < conv_zone_lo
+            conv_zone_lo := low[j]
+        // Dispersion sum from buffer
+        idx = d_size_e - 1 - j
+        if idx >= 0
+            v = array.get(disp_arr, idx)
+            if not na(v)
+                conv_disp_sum += v
+                conv_disp_cnt += 1
+
+// Continuing convergence: extend bounds with current bar; accumulate dispersion
+if is_in_conv and prev_in_conv
+    if not na(high) and high > conv_zone_hi
+        conv_zone_hi := high
+    if not na(low) and low < conv_zone_lo
+        conv_zone_lo := low
+    if not na(dispersion)
+        conv_disp_sum += dispersion
+        conv_disp_cnt += 1
+
+// Exiting convergence: save the zone (single box for the whole period)
+if not is_in_conv and prev_in_conv and not na(conv_start)
+    duration = bar_index - conv_start
+    if duration > 0
+        avg_d = conv_disp_cnt > 0 ? conv_disp_sum / conv_disp_cnt : 0.0
+        array.push(c_start, conv_start)
+        array.push(c_end,   bar_index - 1)
+        array.push(c_hi,    conv_zone_hi)
+        array.push(c_lo,    conv_zone_lo)
+        array.push(c_avg,   avg_d)
+        while array.size(c_start) > conv_max_show
+            array.shift(c_start)
+            array.shift(c_end)
+            array.shift(c_hi)
+            array.shift(c_lo)
+            array.shift(c_avg)
+    conv_start    := na
+    conv_zone_hi  := na
+    conv_zone_lo  := na
+    conv_disp_sum := 0.0
+    conv_disp_cnt := 0
+
+prev_in_conv := is_in_conv
+
+
+// ============================================================
+// SWING POINT DETECTION (state machine)
+// ============================================================
+
+var int   sw_state     = 1
+var float sm_extreme   = na
+var int   actual_bar   = na
+var float actual_price = na
+var int   stale        = 0
+
+var swing_all_bars   = array.new_int(0)
+var swing_all_prices = array.new_float(0)
+var swing_all_types  = array.new_string(0)
+
+sm_current     = sw_state == 1 ? smoothed_high : smoothed_low
+actual_current = sw_state == 1 ? high : low
+
+if not na(sm_current)
+    improved = na(sm_extreme) ? true :
+               (sw_state == 1 ? sm_current > sm_extreme : sm_current < sm_extreme)
+
+    if improved
+        sm_extreme   := sm_current
+        actual_bar   := bar_index
+        actual_price := actual_current
+        stale        := 0
+    else
+        stale += 1
+        if not na(actual_price)
+            actual_further = sw_state == 1 ? actual_current > actual_price : actual_current < actual_price
+            if actual_further
+                actual_bar   := bar_index
+                actual_price := actual_current
+
+    if stale >= patience and not na(actual_bar)
+        conf_type = sw_state == 1 ? "H" : "L"
+        array.push(swing_all_bars,   actual_bar)
+        array.push(swing_all_prices, actual_price)
+        array.push(swing_all_types,  conf_type)
+        sw_state     := sw_state * -1
+        sm_extreme   := sw_state == 1 ? smoothed_high : smoothed_low
+        actual_bar   := bar_index
+        actual_price := sw_state == 1 ? high : low
+        stale        := 0
+
+if array.size(swing_all_bars) > 60
+    array.shift(swing_all_bars)
+    array.shift(swing_all_prices)
+    array.shift(swing_all_types)
+
+
+// ============================================================
+// INSIDE BAR FLAG DETECTION
+// ============================================================
+
+prox = flag_proximity / 100.0
+
+var int   pole_bar    = na
+var float pole_hi     = na
+var float pole_lo     = na
+var int   ib_count    = 0
+var int   total_flags = 0
+
+var f_pole = array.new_int(0)
+var f_end  = array.new_int(0)
+var f_hi   = array.new_float(0)
+var f_lo   = array.new_float(0)
+var f_cnt  = array.new_int(0)
+
+if na(pole_bar)
+    pole_bar := bar_index
+    pole_hi  := high
+    pole_lo  := low
+    ib_count := 0
+else
+    hi_ok = high <= pole_hi * (1.0 + prox)
+    lo_ok = low  >= pole_lo * (1.0 - prox)
+
+    if hi_ok and lo_ok
+        ib_count += 1
+    else
+        if ib_count >= flag_min_inside
+            array.push(f_pole, pole_bar)
+            array.push(f_end,  bar_index - 1)
+            array.push(f_hi,   pole_hi)
+            array.push(f_lo,   pole_lo)
+            array.push(f_cnt,  ib_count)
+            total_flags += 1
+
+            while array.size(f_pole) > flag_max_show
+                array.shift(f_pole)
+                array.shift(f_end)
+                array.shift(f_hi)
+                array.shift(f_lo)
+                array.shift(f_cnt)
+
+        pole_bar := bar_index
+        pole_hi  := high
+        pole_lo  := low
+        ib_count := 0
+
+
+// ============================================================
+// ATR BAND CONSOLIDATION TRACKING
+// ============================================================
+
+inBand = not na(atr_upper) and not na(atr_lower) and close <= atr_upper and close >= atr_lower
+var bool  prev_inBand = false
+var int   atr_start   = na
+var float atr_max_hi  = na
+var float atr_min_lo  = na
+
+var a_start = array.new_int(0)
+var a_end   = array.new_int(0)
+var a_hi    = array.new_float(0)
+var a_lo    = array.new_float(0)
+
+if inBand and not prev_inBand
+    atr_start  := bar_index
+    atr_max_hi := atr_upper
+    atr_min_lo := atr_lower
+
+if inBand and prev_inBand
+    atr_max_hi := math.max(atr_max_hi, atr_upper)
+    atr_min_lo := math.min(atr_min_lo, atr_lower)
+
+if not inBand and prev_inBand and not na(atr_start)
+    duration = bar_index - atr_start
+    if duration >= atr_min_bars
+        array.push(a_start, atr_start)
+        array.push(a_end,   bar_index - 1)
+        array.push(a_hi,    atr_max_hi)
+        array.push(a_lo,    atr_min_lo)
+        while array.size(a_start) > atr_max_show
+            array.shift(a_start)
+            array.shift(a_end)
+            array.shift(a_hi)
+            array.shift(a_lo)
+    atr_start  := na
+    atr_max_hi := na
+    atr_min_lo := na
+
+prev_inBand := inBand
+
+
+// ============================================================
+// MACRO TRENDLINES (functions)
+// ============================================================
+
+var tl_x      = array.new_float(0)
+var tl_y      = array.new_float(0)
+var tl_result = array.new_float(2, 0.0)
+
+collect_points(target_type, n_pts) =>
+    array.clear(tl_x)
+    array.clear(tl_y)
+    sz = array.size(swing_all_bars)
+    if sz > 0
+        for i = 0 to sz - 1
+            if array.get(swing_all_types, i) == target_type
+                array.push(tl_x, float(array.get(swing_all_bars, i)))
+                array.push(tl_y, array.get(swing_all_prices, i))
+    tent_type = sw_state == 1 ? "H" : "L"
+    if tent_type == target_type and not na(actual_bar) and not na(actual_price)
+        array.push(tl_x, float(actual_bar))
+        array.push(tl_y, actual_price)
+    while array.size(tl_x) > n_pts
+        array.shift(tl_x)
+        array.shift(tl_y)
+    array.size(tl_x)
+
+fit_line() =>
+    n = array.size(tl_x)
+    slope = 0.0
+    intercept = 0.0
+    if n >= 2
+        sum_x  = array.sum(tl_x)
+        sum_y  = array.sum(tl_y)
+        mean_x = sum_x / n
+        mean_y = sum_y / n
+        ss_xx = 0.0
+        ss_xy = 0.0
+        for i = 0 to n - 1
+            dx = array.get(tl_x, i) - mean_x
+            dy = array.get(tl_y, i) - mean_y
+            ss_xx += dx * dx
+            ss_xy += dx * dy
+        if ss_xx != 0
+            slope := ss_xy / ss_xx
+            intercept := mean_y - slope * mean_x
+    array.set(tl_result, 0, slope)
+    array.set(tl_result, 1, intercept)
+    n >= 2
+
+
+// ============================================================
+// EVERY-BAR DRAWING (live markers, trendlines)
+// ============================================================
+
+// --- Tentative swing marker ---
+var label tent_label = na
+var line  tent_line  = na
+
+if not na(tent_label)
+    label.delete(tent_label)
+if not na(tent_line)
+    line.delete(tent_line)
+
+if show_tentative and not na(actual_price) and not na(actual_bar)
+    if sw_state == 1
+        tent_label := label.new(actual_bar, actual_price, "SH?",
+                      xloc=xloc.bar_index, style=label.style_label_down,
+                      color=tent_sh_color, textcolor=color.white, size=size.tiny)
+        tent_line := line.new(actual_bar, actual_price, bar_index, actual_price,
+                     xloc=xloc.bar_index, color=tent_sh_color,
+                     width=1, style=line.style_dashed)
+    else
+        tent_label := label.new(actual_bar, actual_price, "SL?",
+                      xloc=xloc.bar_index, style=label.style_label_up,
+                      color=tent_sl_color, textcolor=color.white, size=size.tiny)
+        tent_line := line.new(actual_bar, actual_price, bar_index, actual_price,
+                     xloc=xloc.bar_index, color=tent_sl_color,
+                     width=1, style=line.style_dashed)
+
+// --- Live Inside Bar Flag (BLUE, dashed border) ---
+var box   live_flag_box = na
+var label live_flag_lbl = na
+
+if not na(live_flag_box)
+    box.delete(live_flag_box)
+    live_flag_box := na
+if not na(live_flag_lbl)
+    label.delete(live_flag_lbl)
+    live_flag_lbl := na
+
+if show_flags_live and ib_count >= flag_min_inside and not na(pole_bar)
+    live_flag_box := box.new(pole_bar, pole_hi, bar_index, pole_lo,
+                     bgcolor=flag_box_color, border_color=flag_border_col,
+                     border_width=1, border_style=line.style_dashed)
+    mid_b = pole_bar + (bar_index - pole_bar) / 2
+    live_flag_lbl := label.new(mid_b, pole_hi, str.tostring(ib_count) + " inside...",
+                     xloc=xloc.bar_index, style=label.style_label_down,
+                     color=flag_lbl_color, textcolor=color.white, size=size.tiny)
+
+// --- Live MA Convergence (PURPLE, dashed border) ---
+var box   live_conv_box = na
+var label live_conv_lbl = na
+
+if not na(live_conv_box)
+    box.delete(live_conv_box)
+    live_conv_box := na
+if not na(live_conv_lbl)
+    label.delete(live_conv_lbl)
+    live_conv_lbl := na
+
+if show_conv_live and is_in_conv and not na(conv_start)
+    cur_dur = bar_index - conv_start + 1
+    live_conv_box := box.new(conv_start, conv_zone_hi, bar_index, conv_zone_lo,
+                     bgcolor=conv_box_color, border_color=conv_border_col,
+                     border_width=1, border_style=line.style_dashed)
+    mid_b = conv_start + (bar_index - conv_start) / 2
+    avg_d_live = conv_disp_cnt > 0 ? conv_disp_sum / conv_disp_cnt : 0.0
+    live_conv_lbl := label.new(mid_b, conv_zone_hi,
+                     str.tostring(cur_dur) + " conv | " + str.tostring(math.round(avg_d_live, 3)),
+                     xloc=xloc.bar_index, style=label.style_label_down,
+                     color=conv_lbl_color, textcolor=color.white, size=size.tiny)
+
+// --- Live ATR Consolidation (AMBER, dashed border) ---
+var box   live_atr_box = na
+var label live_atr_lbl = na
+
+if not na(live_atr_box)
+    box.delete(live_atr_box)
+    live_atr_box := na
+if not na(live_atr_lbl)
+    label.delete(live_atr_lbl)
+    live_atr_lbl := na
+
+if show_atr_live and inBand and not na(atr_start)
+    cur_dur = bar_index - atr_start + 1
+    if cur_dur >= atr_min_bars
+        live_atr_box := box.new(atr_start, atr_max_hi, bar_index, atr_min_lo,
+                        bgcolor=atr_box_color, border_color=atr_border_col,
+                        border_width=1, border_style=line.style_dashed)
+        mid_b = atr_start + (bar_index - atr_start) / 2
+        live_atr_lbl := label.new(mid_b, atr_max_hi, str.tostring(cur_dur) + " ATR-band...",
+                        xloc=xloc.bar_index, style=label.style_label_down,
+                        color=atr_lbl_color, textcolor=color.white, size=size.tiny)
+
+// --- Macro Trendlines (single pair, redrawn every bar) ---
+var line res_tl_line = na
+var line sup_tl_line = na
+
+if not na(res_tl_line)
+    line.delete(res_tl_line)
+    res_tl_line := na
+if not na(sup_tl_line)
+    line.delete(sup_tl_line)
+    sup_tl_line := na
+
+if show_res_tl
+    n_found_h = collect_points("H", tl_n_points)
+    if n_found_h >= 2
+        valid_h = fit_line()
+        if valid_h
+            slope_h = array.get(tl_result, 0)
+            int_h   = array.get(tl_result, 1)
+            x1h = int(array.first(tl_x))
+            y1h = slope_h * x1h + int_h
+            x2h = bar_index + tl_extend_bars
+            y2h = slope_h * x2h + int_h
+            res_tl_line := line.new(x1h, y1h, x2h, y2h,
+                           xloc=xloc.bar_index, color=tl_res_color,
+                           width=2, style=line.style_dashed)
+
+if show_sup_tl
+    n_found_l = collect_points("L", tl_n_points)
+    if n_found_l >= 2
+        valid_l = fit_line()
+        if valid_l
+            slope_l = array.get(tl_result, 0)
+            int_l   = array.get(tl_result, 1)
+            x1l = int(array.first(tl_x))
+            y1l = slope_l * x1l + int_l
+            x2l = bar_index + tl_extend_bars
+            y2l = slope_l * x2l + int_l
+            sup_tl_line := line.new(x1l, y1l, x2l, y2l,
+                           xloc=xloc.bar_index, color=tl_sup_color,
+                           width=2, style=line.style_dashed)
+
+
+// ============================================================
+// LAST-BAR DRAWING (historical boxes, swings, table)
+// ============================================================
+
+if barstate.islast
+
+    // --- Historical Inside Bar Flags ---
+    if show_flags and array.size(f_pole) > 0
+        for i = 0 to array.size(f_pole) - 1
+            pb = array.get(f_pole, i)
+            eb = array.get(f_end,  i)
+            fh = array.get(f_hi,   i)
+            fl = array.get(f_lo,   i)
+            fc = array.get(f_cnt,  i)
+            box.new(pb, fh, eb, fl,
+                bgcolor=flag_box_color, border_color=flag_border_col,
+                border_width=2, border_style=line.style_solid)
+            mid_bar = pb + (eb - pb) / 2
+            label.new(mid_bar, fh, str.tostring(fc) + " inside",
+                xloc=xloc.bar_index, style=label.style_label_down,
+                color=flag_lbl_color, textcolor=color.white, size=size.tiny)
+
+    // --- Historical MA Convergence Zones (single box per period) ---
+    if show_conv and array.size(c_start) > 0
+        for i = 0 to array.size(c_start) - 1
+            cs = array.get(c_start, i)
+            ce = array.get(c_end,   i)
+            ch = array.get(c_hi,    i)
+            cl = array.get(c_lo,    i)
+            ca = array.get(c_avg,   i)
+            box.new(cs, ch, ce, cl,
+                bgcolor=conv_box_color, border_color=conv_border_col,
+                border_width=2, border_style=line.style_solid)
+            mid_bar = cs + (ce - cs) / 2
+            dur = ce - cs + 1
+            label.new(mid_bar, ch, str.tostring(dur) + " conv | " + str.tostring(math.round(ca, 3)),
+                xloc=xloc.bar_index, style=label.style_label_down,
+                color=conv_lbl_color, textcolor=color.white, size=size.tiny)
+
+    // --- Historical ATR Consolidation Boxes ---
+    if show_atr_boxes and array.size(a_start) > 0
+        for i = 0 to array.size(a_start) - 1
+            ast = array.get(a_start, i)
+            aen = array.get(a_end,   i)
+            ahi = array.get(a_hi,    i)
+            alo = array.get(a_lo,    i)
+            dur = aen - ast + 1
+            box.new(ast, ahi, aen, alo,
+                bgcolor=atr_box_color, border_color=atr_border_col,
+                border_width=2, border_style=line.style_solid)
+            mid_bar = ast + (aen - ast) / 2
+            label.new(mid_bar, ahi, str.tostring(dur) + " ATR-band",
+                xloc=xloc.bar_index, style=label.style_label_down,
+                color=atr_lbl_color, textcolor=color.white, size=size.tiny)
+
+    // --- Swing labels (cap to last N) ---
+    if show_swings and array.size(swing_all_bars) > 0
+        sz = array.size(swing_all_bars)
+        start_idx = math.max(0, sz - swing_max_show)
+        for i = start_idx to sz - 1
+            b = array.get(swing_all_bars,   i)
+            p = array.get(swing_all_prices, i)
+            t = array.get(swing_all_types,  i)
+            lbl_style = t == "H" ? label.style_label_down : label.style_label_up
+            lbl_color = t == "H" ? swing_sh_color : swing_sl_color
+            label.new(b, p, t == "H" ? "SH" : "SL",
+                      xloc=xloc.bar_index, style=lbl_style,
+                      color=lbl_color, textcolor=color.white, size=size.tiny)
+
+    // --- Info table (top-right) — RVOL & ADR only, bold ---
+    var table info = table.new(position.top_right, 2, 2,
+                     bgcolor=color.new(color.yellow, 0),
+                     frame_width=1, frame_color=color.black, border_width=1)
+    table.cell(info, 0, 0, "RVOL:", text_color=color.black, text_size=size.normal, text_formatting=text.format_bold)
+    table.cell(info, 1, 0, rvol_text, text_color=color.black, text_size=size.normal, text_formatting=text.format_bold)
+    table.cell(info, 0, 1, "ADR:",  text_color=color.black, text_size=size.normal, text_formatting=text.format_bold)
+    table.cell(info, 1, 1, adr_text, text_color=color.black, text_size=size.normal, text_formatting=text.format_bold)

@@ -1,0 +1,148 @@
+//@version=5
+// =====================================================================
+// Moving Average Support/Resistance Bounce Indicator
+// Based on the methodology described in the YouTube video where bounces
+// off a moving average (with ATR-based bands) are quantitatively tested.
+//
+// Logic:
+//   - Price ABOVE upper band  -> uptrend, MA acts as SUPPORT
+//   - Price BELOW lower band  -> downtrend, MA acts as RESISTANCE
+//   - When price enters the band region, wait until it exits:
+//       * Exits same side it entered  -> BOUNCE  (entry signal)
+//       * Exits opposite side          -> PENETRATION (no signal)
+//
+// Optimal hourly periods found in the video: 70, 145, 200
+// =====================================================================
+indicator("MA S/R Bounce Strategy", overlay=true, max_labels_count=500)
+
+// ---------- Inputs ----------
+maPeriod   = input.int(200,   "Moving Average Period", minval=1,
+                       tooltip="Video found 70, 145 and 200 to be the strongest on hourly BTC")
+maType     = input.string("SMA", "MA Type", options=["SMA", "EMA"])
+atrPeriod  = input.int(200,   "ATR Period",  minval=1)
+atrMult    = input.float(0.5, "ATR Band Multiplier", minval=0.1, step=0.1)
+showBands  = input.bool(true,  "Show ATR Bands")
+showPen    = input.bool(false, "Show Penetrations (non-signals)")
+
+// ---------- Calculations ----------
+ma        = maType == "SMA" ? ta.sma(close, maPeriod) : ta.ema(close, maPeriod)
+atr       = ta.atr(atrPeriod)
+upperBand = ma + atrMult * atr
+lowerBand = ma - atrMult * atr
+
+// ---------- Plot MA & Bands ----------
+plot(ma, "MA", color=color.new(color.blue, 0), linewidth=2)
+plot(showBands ? upperBand : na, "Upper Band", color=color.new(color.gray, 50))
+plot(showBands ? lowerBand : na, "Lower Band", color=color.new(color.gray, 50))
+
+// ---------- State Machine ----------
+//  -1 = uninitialised
+//   0 = price clearly ABOVE upper band  (uptrend, no test in progress)
+//   1 = price IN BAND, entered from ABOVE  (support being tested)
+//   2 = price clearly BELOW lower band  (downtrend, no test in progress)
+//   3 = price IN BAND, entered from BELOW  (resistance being tested)
+var int state = -1
+
+bool supportBounce      = false
+bool supportPenetration = false
+bool resistBounce       = false
+bool resistPenetration  = false
+
+if not na(upperBand) and not na(lowerBand)
+    if state == -1
+        state := close > upperBand ? 0 : close < lowerBand ? 2 : (close >= ma ? 1 : 3)
+
+    else if state == 0
+        // was above upper band
+        if close < lowerBand
+            // big move all the way through -> immediate penetration
+            supportPenetration := true
+            state := 2
+        else if close < upperBand
+            state := 1                          // entered band from above
+
+    else if state == 1
+        // testing support (came from above)
+        if close > upperBand
+            supportBounce := true               // BOUNCE -> long entry
+            state := 0
+        else if close < lowerBand
+            supportPenetration := true          // broke through
+            state := 2
+
+    else if state == 2
+        // was below lower band
+        if close > upperBand
+            resistPenetration := true           // big move through both bands
+            state := 0
+        else if close > lowerBand
+            state := 3                          // entered band from below
+
+    else if state == 3
+        // testing resistance (came from below)
+        if close < lowerBand
+            resistBounce := true                // BOUNCE -> short entry
+            state := 2
+        else if close > upperBand
+            resistPenetration := true           // broke through
+            state := 0
+
+// ---------- Signal Plots ----------
+plotshape(supportBounce, "Support Bounce (LONG)",
+          style=shape.triangleup, location=location.belowbar,
+          color=color.new(color.green, 0), text="BUY",
+          textcolor=color.white, size=size.small)
+
+plotshape(resistBounce, "Resistance Bounce (SHORT)",
+          style=shape.triangledown, location=location.abovebar,
+          color=color.new(color.red, 0), text="SELL",
+          textcolor=color.white, size=size.small)
+
+plotshape(showPen and supportPenetration, "Support Penetration",
+          style=shape.xcross, location=location.belowbar,
+          color=color.new(color.yellow, 0), size=size.tiny)
+
+plotshape(showPen and resistPenetration,  "Resistance Penetration",
+          style=shape.xcross, location=location.abovebar,
+          color=color.new(color.orange, 0), size=size.tiny)
+
+// ---------- Alerts ----------
+alertcondition(supportBounce, title="Long Entry  (Support Bounce)",
+               message="MA Support Bounce — LONG entry on {{ticker}} {{interval}}")
+alertcondition(resistBounce,  title="Short Entry (Resistance Bounce)",
+               message="MA Resistance Bounce — SHORT entry on {{ticker}} {{interval}}")
+
+// ---------- Optional Stats Table ----------
+var int totalSupBounce = 0
+var int totalSupPen    = 0
+var int totalResBounce = 0
+var int totalResPen    = 0
+
+if supportBounce
+    totalSupBounce += 1
+if supportPenetration
+    totalSupPen += 1
+if resistBounce
+    totalResBounce += 1
+if resistPenetration
+    totalResPen += 1
+
+if barstate.islast
+    var table t = table.new(position.top_right, 2, 6, border_width=1)
+    totalBounces = totalSupBounce + totalResBounce
+    totalEvents  = totalBounces + totalSupPen + totalResPen
+    bouncePct    = totalEvents > 0 ? 100.0 * totalBounces / totalEvents : 0.0
+
+    table.cell(t, 0, 0, "Metric",          bgcolor=color.new(color.blue, 70), text_color=color.white)
+    table.cell(t, 1, 0, "Count",           bgcolor=color.new(color.blue, 70), text_color=color.white)
+    table.cell(t, 0, 1, "Support Bounces",      text_color=color.white)
+    table.cell(t, 1, 1, str.tostring(totalSupBounce), text_color=color.white)
+    table.cell(t, 0, 2, "Support Penetrations", text_color=color.white)
+    table.cell(t, 1, 2, str.tostring(totalSupPen),    text_color=color.white)
+    table.cell(t, 0, 3, "Resistance Bounces",   text_color=color.white)
+    table.cell(t, 1, 3, str.tostring(totalResBounce), text_color=color.white)
+    table.cell(t, 0, 4, "Resistance Penetrations", text_color=color.white)
+    table.cell(t, 1, 4, str.tostring(totalResPen),    text_color=color.white)
+    table.cell(t, 0, 5, "Bounce %",         bgcolor=color.new(color.green, 70), text_color=color.white)
+    table.cell(t, 1, 5, str.tostring(bouncePct, "#.##") + "%",
+               bgcolor=color.new(color.green, 70), text_color=color.white)
