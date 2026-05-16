@@ -221,3 +221,9 @@ def moving_average_features(data: pl.DataFrame | pl.LazyFrame) -> pl.LazyFrame:
     )
 
     return res
+
+
+def gen_features(data: pl.DataFrame | pl.LazyFrame) -> pl.LazyFrame:
+    """
+    Gen Features
+    """
