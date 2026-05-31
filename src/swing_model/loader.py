@@ -31,6 +31,7 @@ def gen_stocks_list(
         .group_by("date")
         .agg(pl.col("symbol").len().alias("symbol_count"), pl.col("symbol"))
         .sort("date")
+        .rename({"date": "timestamp"})
     )
 
     return res

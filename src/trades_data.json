@@ -1,0 +1,107 @@
+{
+  "positions": [
+    {
+      "id": 1,
+      "ticker": "CEMPRO",
+      "side": "long",
+      "entry": 893.575,
+      "stop": 820,
+      "qty": 2200,
+      "cmp": 1071.15,
+      "date": "2026-05-26",
+      "target": 1200,
+      "paper": false,
+      "setup": "Breakout",
+      "notes": "",
+      "exits": [
+        {
+          "price": 1000,
+          "qty": 750,
+          "date": "2026-05-28",
+          "note": "T1 hit"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "ticker": "NETWEB",
+      "side": "long",
+      "entry": 4170.99,
+      "stop": 3950,
+      "qty": 1700,
+      "cmp": 4629,
+      "date": "2026-05-23",
+      "target": 5200,
+      "paper": false,
+      "setup": "VCP",
+      "notes": "",
+      "exits": [
+        {
+          "price": 4500,
+          "qty": 425,
+          "date": "2026-05-27",
+          "note": "Partial T1"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "ticker": "OMNI",
+      "side": "long",
+      "entry": 446.4,
+      "stop": 415,
+      "qty": 2700,
+      "cmp": 501.45,
+      "date": "2026-05-24",
+      "target": 560,
+      "paper": false,
+      "setup": "Breakout",
+      "notes": "",
+      "exits": []
+    },
+    {
+      "id": 4,
+      "ticker": "WIPRO",
+      "side": "long",
+      "entry": 480,
+      "stop": 455,
+      "qty": 500,
+      "cmp": 450,
+      "date": "2026-05-10",
+      "target": 550,
+      "paper": false,
+      "setup": "Pullback",
+      "notes": "",
+      "exits": [
+        {
+          "price": 450,
+          "qty": 500,
+          "date": "2026-05-28",
+          "note": "Stopped out"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "ticker": "NIFTY",
+      "side": "long",
+      "entry": 22000,
+      "stop": 21500,
+      "qty": 50,
+      "cmp": 22800,
+      "date": "2026-05-20",
+      "target": 23500,
+      "paper": true,
+      "setup": "Index test",
+      "notes": "paper trial",
+      "exits": []
+    }
+  ],
+  "settings": {
+    "portfolio": 5000000,
+    "risk_pct": 1.0,
+    "paper_in_metrics": false
+  },
+  "next_id": 6,
+  "filter": "all"
+}

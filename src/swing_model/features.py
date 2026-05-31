@@ -470,35 +470,35 @@ def gen_features(data: pl.DataFrame | pl.LazyFrame) -> pl.LazyFrame:
             # ADR 20 Pct
             + [(pl.col("adr_20") / pl.col("close")).round(4).alias("adr_pct_20")]
         )
-        .with_columns(
-            [
-                pl.col(col)
-                .log()
-                .rolling_map(rolling_slope, window_size=n)
-                .over(
-                    partition_by="symbol",
-                    order_by="timestamp",
-                    descending=False,
-                )
-                .round(4)
-                .alias(f"{col}_regression_slope_{n}")
-                for n in [3, 5, 10]
-                for col in ["close", "close_ema_21", "close_sma_50"]
-            ]
-            + [
-                pl.col(col)
-                .rolling_map(rolling_r2, window_size=n)
-                .over(
-                    partition_by="symbol",
-                    order_by="timestamp",
-                    descending=False,
-                )
-                .round(4)
-                .alias(f"{col}_regression_r2_{n}")
-                for n in [3, 5, 10]
-                for col in ["close", "close_ema_21", "close_sma_50"]
-            ]
-        )
+        # .with_columns(
+        #     [
+        #         pl.col(col)
+        #         .log()
+        #         .rolling_map(rolling_slope, window_size=n)
+        #         .over(
+        #             partition_by="symbol",
+        #             order_by="timestamp",
+        #             descending=False,
+        #         )
+        #         .round(4)
+        #         .alias(f"{col}_regression_slope_{n}")
+        #         for n in [3, 5, 10]
+        #         for col in ["close", "close_ema_21", "close_sma_50"]
+        #     ]
+        #     + [
+        #         pl.col(col)
+        #         .rolling_map(rolling_r2, window_size=n)
+        #         .over(
+        #             partition_by="symbol",
+        #             order_by="timestamp",
+        #             descending=False,
+        #         )
+        #         .round(4)
+        #         .alias(f"{col}_regression_r2_{n}")
+        #         for n in [3, 5, 10]
+        #         for col in ["close", "close_ema_21", "close_sma_50"]
+        #     ]
+        # )
         .select(
             [
                 "symbol",
@@ -539,24 +539,24 @@ def gen_features(data: pl.DataFrame | pl.LazyFrame) -> pl.LazyFrame:
                 "atr_ratio_14_50",
                 "atr_pct_20",
                 "adr_pct_20",
-                "close_regression_slope_3",
-                "close_ema_21_regression_slope_3",
-                "close_sma_50_regression_slope_3",
-                "close_regression_slope_5",
-                "close_ema_21_regression_slope_5",
-                "close_sma_50_regression_slope_5",
-                "close_regression_slope_10",
-                "close_ema_21_regression_slope_10",
-                "close_sma_50_regression_slope_10",
-                "close_regression_r2_3",
-                "close_ema_21_regression_r2_3",
-                "close_sma_50_regression_r2_3",
-                "close_regression_r2_5",
-                "close_ema_21_regression_r2_5",
-                "close_sma_50_regression_r2_5",
-                "close_regression_r2_10",
-                "close_ema_21_regression_r2_10",
-                "close_sma_50_regression_r2_10",
+                # "close_regression_slope_3",
+                # "close_ema_21_regression_slope_3",
+                # "close_sma_50_regression_slope_3",
+                # "close_regression_slope_5",
+                # "close_ema_21_regression_slope_5",
+                # "close_sma_50_regression_slope_5",
+                # "close_regression_slope_10",
+                # "close_ema_21_regression_slope_10",
+                # "close_sma_50_regression_slope_10",
+                # "close_regression_r2_3",
+                # "close_ema_21_regression_r2_3",
+                # "close_sma_50_regression_r2_3",
+                # "close_regression_r2_5",
+                # "close_ema_21_regression_r2_5",
+                # "close_sma_50_regression_r2_5",
+                # "close_regression_r2_10",
+                # "close_ema_21_regression_r2_10",
+                # "close_sma_50_regression_r2_10",
             ]
         )
     )
